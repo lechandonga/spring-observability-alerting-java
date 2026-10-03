@@ -63,8 +63,25 @@ public final class AlertEngine {
 
     /** Atomically replaces the rule set; evaluators see old or new, never a mix. */
     public void updateRules(List<AlertRule> newRules) {
-        rules.set(List.copyOf(newRules));
+        List<AlertRule> copy = List.copyOf(newRules);
+        Map<String, AlertRule> previous = byName(rules.get());
+        Map<String, AlertRule> next = byName(copy);
+        rules.set(copy);
+        // Turn the page on changed or deleted rules: their trigger/cooldown/
+        // recovery state is dropped, so a redefined rule starts from a clean
+        // slate and a deleted rule releases its state. Windowed event data is
+        // kept per series and still counts toward the new definition.
+        ruleRuntimes.keySet().removeIf(name ->
+                !next.containsKey(name) || !next.get(name).equals(previous.get(name)));
         log.info("alert rules updated atomically, count={}", newRules.size());
+    }
+
+    private static Map<String, AlertRule> byName(List<AlertRule> ruleList) {
+        Map<String, AlertRule> map = new ConcurrentHashMap<>();
+        for (AlertRule rule : ruleList) {
+            map.put(rule.name(), rule);
+        }
+        return map;
     }
 
     public List<AlertRule> currentRules() {
@@ -83,7 +100,7 @@ public final class AlertEngine {
             String series = rule.endpoint() + "|" + rule.statusClass();
             SeriesState state = states.get(series);
             long windowCount = countInWindow(state, rule.name(), rule.window(), now);
-            EvaluationRecord.Decision decision = decide(rule, state, windowCount, now);
+            EvaluationRecord.Decision decision = decide(rule, windowCount, now);
             evaluationLog.add(new EvaluationRecord(rule.name(), series, now, windowCount, rule.threshold(), decision));
             log.debug("evaluate rule={} series={} windowCount={} threshold={} decision={}",
                     rule.name(), series, windowCount, rule.threshold(), decision);
@@ -98,22 +115,26 @@ public final class AlertEngine {
         return fired;
     }
 
-    private EvaluationRecord.Decision decide(AlertRule rule, SeriesState state, long windowCount, Instant now) {
+    private EvaluationRecord.Decision decide(AlertRule rule, long windowCount, Instant now) {
         RuleRuntime rt = ruleRuntimes.computeIfAbsent(rule.name(), k -> new RuleRuntime());
+        rt.lastEvaluatedAt = now;
+        rt.lastWindowCount = windowCount;
+        EvaluationRecord.Decision decision;
         if (windowCount < rule.threshold()) {
             rt.recovered = true;
-            return EvaluationRecord.Decision.OK;
-        }
-        if (rt.lastFiredAt != null
+            decision = EvaluationRecord.Decision.OK;
+        } else if (rt.lastFiredAt != null
                 && Duration.between(rt.lastFiredAt, now).compareTo(rule.cooldown()) < 0) {
-            return EvaluationRecord.Decision.SUPPRESSED_BY_COOLDOWN;
+            decision = EvaluationRecord.Decision.SUPPRESSED_BY_COOLDOWN;
+        } else if (!rt.recovered) {
+            decision = EvaluationRecord.Decision.SUPPRESSED_NOT_RECOVERED;
+        } else {
+            rt.lastFiredAt = now;
+            rt.recovered = false;
+            decision = EvaluationRecord.Decision.FIRED;
         }
-        if (!rt.recovered) {
-            return EvaluationRecord.Decision.SUPPRESSED_NOT_RECOVERED;
-        }
-        rt.lastFiredAt = now;
-        rt.recovered = false;
-        return EvaluationRecord.Decision.FIRED;
+        rt.lastDecision = decision;
+        return decision;
     }
 
     private long countInWindow(SeriesState state, String ruleName, Duration window, Instant now) {
@@ -155,6 +176,43 @@ public final class AlertEngine {
         return states.size();
     }
 
+    /** Number of live per-rule runtime entries; exposed for leak checks. */
+    public int ruleRuntimeCount() {
+        return ruleRuntimes.size();
+    }
+
+    /**
+     * Snapshot of each current rule's runtime status, consistent with the
+     * evaluation log. Read-only: never mutates evaluator state. Rules that
+     * were deleted or redefined since the last evaluation show up with their
+     * fresh (empty) runtime, or not at all.
+     */
+    public List<RuleStatus> ruleStatuses() {
+        Instant now = clock.instant();
+        List<RuleStatus> statuses = new ArrayList<>();
+        for (AlertRule rule : rules.get()) {
+            RuleRuntime rt = ruleRuntimes.get(rule.name());
+            if (rt == null) {
+                statuses.add(new RuleStatus(rule.name(), null, 0, rule.threshold(),
+                        null, false, Duration.ZERO, true, null));
+                continue;
+            }
+            boolean inCooldown = false;
+            Duration remaining = Duration.ZERO;
+            if (rt.lastFiredAt != null) {
+                Duration elapsed = Duration.between(rt.lastFiredAt, now);
+                if (elapsed.compareTo(rule.cooldown()) < 0) {
+                    inCooldown = true;
+                    remaining = rule.cooldown().minus(elapsed);
+                }
+            }
+            statuses.add(new RuleStatus(rule.name(), rt.lastEvaluatedAt, rt.lastWindowCount,
+                    rule.threshold(), rt.lastDecision, inCooldown, remaining,
+                    rt.recovered, rt.lastFiredAt));
+        }
+        return statuses;
+    }
+
     private final Map<String, RuleRuntime> ruleRuntimes = new ConcurrentHashMap<>();
 
     private static final class SeriesState {
@@ -163,7 +221,10 @@ public final class AlertEngine {
     }
 
     private static final class RuleRuntime {
-        Instant lastFiredAt;
-        boolean recovered = true;
+        volatile Instant lastFiredAt;
+        volatile boolean recovered = true;
+        volatile Instant lastEvaluatedAt;
+        volatile long lastWindowCount;
+        volatile EvaluationRecord.Decision lastDecision;
     }
 }

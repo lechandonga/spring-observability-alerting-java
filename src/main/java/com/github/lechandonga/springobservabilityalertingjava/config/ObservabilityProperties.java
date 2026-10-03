@@ -21,6 +21,9 @@ public class ObservabilityProperties {
     /** How often alert rules are evaluated. */
     private Duration evaluationInterval = Duration.ofSeconds(10);
 
+    /** Hard cap on the number of alert rules (configured + runtime-added). */
+    private int maxRules = 100;
+
     /** Alert rules, evaluated atomically as one set. */
     private List<Rule> rules = new ArrayList<>();
 
@@ -46,6 +49,14 @@ public class ObservabilityProperties {
 
     public void setEvaluationInterval(Duration evaluationInterval) {
         this.evaluationInterval = evaluationInterval;
+    }
+
+    public int getMaxRules() {
+        return maxRules;
+    }
+
+    public void setMaxRules(int maxRules) {
+        this.maxRules = maxRules;
     }
 
     public List<Rule> getRules() {

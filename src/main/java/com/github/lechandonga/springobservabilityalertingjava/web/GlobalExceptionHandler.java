@@ -1,5 +1,6 @@
 package com.github.lechandonga.springobservabilityalertingjava.web;
 
+import com.github.lechandonga.springobservabilityalertingjava.alert.RuleValidationException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
@@ -18,6 +19,25 @@ import java.util.Map;
 public class GlobalExceptionHandler {
 
     private static final Logger log = LoggerFactory.getLogger(GlobalExceptionHandler.class);
+
+    /**
+     * Rejected rule changes are client errors with a machine-readable
+     * {@code reason} so callers can distinguish a missing field from a
+     * duplicate name, an unknown rule, or an exceeded limit.
+     */
+    @ExceptionHandler(RuleValidationException.class)
+    public ResponseEntity<Map<String, Object>> handleRuleValidation(RuleValidationException ex) {
+        HttpStatus status = switch (ex.reason()) {
+            case RULE_NOT_FOUND -> HttpStatus.NOT_FOUND;
+            case DUPLICATE_NAME, LIMIT_EXCEEDED -> HttpStatus.CONFLICT;
+            default -> HttpStatus.BAD_REQUEST;
+        };
+        log.warn("rule change rejected: reason={} message={}", ex.reason(), ex.getMessage());
+        return ResponseEntity.status(status).body(Map.of(
+                "error", "RuleValidation",
+                "reason", ex.reason().name(),
+                "message", String.valueOf(ex.getMessage())));
+    }
 
     @ExceptionHandler(Exception.class)
     public ResponseEntity<Map<String, Object>> handle(Exception ex) {
