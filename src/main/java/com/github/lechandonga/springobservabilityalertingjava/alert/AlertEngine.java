@@ -9,6 +9,7 @@ import java.time.Instant;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -41,8 +42,11 @@ public final class AlertEngine {
 
     private final Clock clock;
     private final Duration idleTtl;
+    private final Object mutationLock = new Object();
     private final AtomicReference<List<AlertRule>> rules = new AtomicReference<>(List.of());
     private final ConcurrentHashMap<String, SeriesState> states = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, RuleRuntime> ruleRuntimes = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, RuleStatus> ruleStatuses = new ConcurrentHashMap<>();
     private final CopyOnWriteArrayList<AlertEvent> firedAlerts = new CopyOnWriteArrayList<>();
     private final CopyOnWriteArrayList<EvaluationRecord> evaluationLog = new CopyOnWriteArrayList<>();
 
@@ -61,10 +65,41 @@ public final class AlertEngine {
         }
     }
 
-    /** Atomically replaces the rule set; evaluators see old or new, never a mix. */
+    /**
+     * Atomically replaces the rule set; evaluators see old or new, never a mix.
+     *
+     * <p>A rule whose definition changed (or that was removed) gets a fresh
+     * runtime: its fire/cooldown/recovery memory and its status view entry are
+     * dropped, so from this point on it behaves exactly as if it had always
+     * been the new definition. Buffered window events are kept and still count
+     * towards the new definition. Removed rules release all their state.
+     */
     public void updateRules(List<AlertRule> newRules) {
-        rules.set(List.copyOf(newRules));
-        log.info("alert rules updated atomically, count={}", newRules.size());
+        List<AlertRule> copy = List.copyOf(newRules);
+        synchronized (mutationLock) {
+            List<AlertRule> previous = rules.getAndSet(copy);
+            Map<String, AlertRule> newByName = new HashMap<>();
+            for (AlertRule r : copy) {
+                newByName.put(r.name(), r);
+            }
+            Map<String, AlertRule> oldByName = new HashMap<>();
+            for (AlertRule r : previous) {
+                oldByName.put(r.name(), r);
+            }
+            ruleRuntimes.keySet().removeIf(name -> staleRuntime(name, newByName, oldByName));
+            ruleStatuses.keySet().removeIf(name -> staleRuntime(name, newByName, oldByName));
+            log.info("alert rules updated atomically, count={}", copy.size());
+        }
+    }
+
+    private static boolean staleRuntime(String name, Map<String, AlertRule> newByName,
+            Map<String, AlertRule> oldByName) {
+        AlertRule next = newByName.get(name);
+        if (next == null) {
+            return true; // rule removed -> release its state
+        }
+        AlertRule prev = oldByName.get(name);
+        return prev != null && !prev.equals(next); // redefined -> start from a clean slate
     }
 
     public List<AlertRule> currentRules() {
@@ -76,30 +111,45 @@ public final class AlertEngine {
      * Must be called from a single thread (the scheduler).
      */
     public List<AlertEvent> evaluate() {
-        Instant now = clock.instant();
-        evictIdleSeries(now);
-        List<AlertEvent> fired = new ArrayList<>();
-        for (AlertRule rule : rules.get()) {
-            String series = rule.endpoint() + "|" + rule.statusClass();
-            SeriesState state = states.get(series);
-            long windowCount = countInWindow(state, rule.name(), rule.window(), now);
-            EvaluationRecord.Decision decision = decide(rule, state, windowCount, now);
-            evaluationLog.add(new EvaluationRecord(rule.name(), series, now, windowCount, rule.threshold(), decision));
-            log.debug("evaluate rule={} series={} windowCount={} threshold={} decision={}",
-                    rule.name(), series, windowCount, rule.threshold(), decision);
-            if (decision == EvaluationRecord.Decision.FIRED) {
-                AlertEvent event = new AlertEvent(rule.name(), series, now, windowCount, rule.threshold());
-                firedAlerts.add(event);
-                fired.add(event);
-                log.warn("ALERT fired rule={} series={} windowCount={} threshold={}",
-                        rule.name(), series, windowCount, rule.threshold());
+        synchronized (mutationLock) {
+            Instant now = clock.instant();
+            evictIdleSeries(now);
+            List<AlertEvent> fired = new ArrayList<>();
+            for (AlertRule rule : rules.get()) {
+                String series = rule.endpoint() + "|" + rule.statusClass();
+                SeriesState state = states.get(series);
+                long windowCount = countInWindow(state, rule.name(), rule.window(), now);
+                RuleRuntime rt = ruleRuntimes.computeIfAbsent(rule.name(), k -> new RuleRuntime());
+                EvaluationRecord.Decision decision = decide(rule, rt, windowCount, now);
+                evaluationLog.add(new EvaluationRecord(rule.name(), series, now, windowCount, rule.threshold(), decision));
+                ruleStatuses.put(rule.name(), toStatus(rule, rt, windowCount, decision, now));
+                log.debug("evaluate rule={} series={} windowCount={} threshold={} decision={}",
+                        rule.name(), series, windowCount, rule.threshold(), decision);
+                if (decision == EvaluationRecord.Decision.FIRED) {
+                    AlertEvent event = new AlertEvent(rule.name(), series, now, windowCount, rule.threshold());
+                    firedAlerts.add(event);
+                    fired.add(event);
+                    log.warn("ALERT fired rule={} series={} windowCount={} threshold={}",
+                            rule.name(), series, windowCount, rule.threshold());
+                }
             }
+            return fired;
         }
-        return fired;
     }
 
-    private EvaluationRecord.Decision decide(AlertRule rule, SeriesState state, long windowCount, Instant now) {
-        RuleRuntime rt = ruleRuntimes.computeIfAbsent(rule.name(), k -> new RuleRuntime());
+    private static RuleStatus toStatus(AlertRule rule, RuleRuntime rt, long windowCount,
+            EvaluationRecord.Decision decision, Instant now) {
+        boolean inCooldown = rt.lastFiredAt != null
+                && Duration.between(rt.lastFiredAt, now).compareTo(rule.cooldown()) < 0;
+        Duration remaining = inCooldown
+                ? rule.cooldown().minus(Duration.between(rt.lastFiredAt, now))
+                : Duration.ZERO;
+        return new RuleStatus(rule.name(), rule.endpoint() + "|" + rule.statusClass(), now,
+                windowCount, rule.threshold(), inCooldown, remaining, rt.recovered,
+                rt.lastFiredAt, decision);
+    }
+
+    private EvaluationRecord.Decision decide(AlertRule rule, RuleRuntime rt, long windowCount, Instant now) {
         if (windowCount < rule.threshold()) {
             rt.recovered = true;
             return EvaluationRecord.Decision.OK;
@@ -151,11 +201,19 @@ public final class AlertEngine {
         return List.copyOf(evaluationLog);
     }
 
+    /** Read-only snapshot of per-rule runtime status; safe to call from any thread. */
+    public List<RuleStatus> ruleStatuses() {
+        return List.copyOf(ruleStatuses.values());
+    }
+
     public int trackedSeriesCount() {
         return states.size();
     }
 
-    private final Map<String, RuleRuntime> ruleRuntimes = new ConcurrentHashMap<>();
+    /** Number of per-rule runtime entries currently held (for leak checks). */
+    public int trackedRuleStateCount() {
+        return ruleRuntimes.size();
+    }
 
     private static final class SeriesState {
         final Deque<Instant> events = new ArrayDeque<>();

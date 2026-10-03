@@ -2,6 +2,7 @@ package com.github.lechandonga.springobservabilityalertingjava.config;
 
 import com.github.lechandonga.springobservabilityalertingjava.alert.AlertEngine;
 import com.github.lechandonga.springobservabilityalertingjava.alert.AlertRule;
+import com.github.lechandonga.springobservabilityalertingjava.alert.RuleManager;
 import com.github.lechandonga.springobservabilityalertingjava.metrics.RequestMetrics;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
@@ -35,5 +36,10 @@ public class ObservabilityConfig {
                 .toList();
         engine.updateRules(rules);
         return engine;
+    }
+
+    @Bean
+    public RuleManager ruleManager(AlertEngine alertEngine, ObservabilityProperties props) {
+        return new RuleManager(alertEngine, props.getMaxRules());
     }
 }
