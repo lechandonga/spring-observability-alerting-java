@@ -23,6 +23,12 @@ import java.util.concurrent.atomic.AtomicReference;
  *   <li>Rule updates are atomic for evaluators: the whole rule list lives in
  *       one {@link AtomicReference}, so an evaluation always sees a consistent
  *       snapshot, never a half-applied update.</li>
+ *   <li>Rule changes and evaluation are mutually exclusive: {@link #updateRules}
+ *       and {@link #evaluate()} share one lock, so a committed change cannot be
+ *       overtaken by an in-flight evaluation. A redefined rule's trigger /
+ *       cooldown / recovery memory is dropped before any further evaluation can
+ *       touch it, and a deleted rule can neither fire nor have its runtime
+ *       re-created by a concurrent evaluation pass.</li>
  *   <li>A rule fires at most once per cooldown period, and only re-arms after
  *       the windowed count dropped below the threshold (recovery).</li>
  *   <li>Series with no events for {@code idleTtl} are evicted, so long-dead
@@ -42,7 +48,15 @@ public final class AlertEngine {
     private final Clock clock;
     private final Duration idleTtl;
     private final AtomicReference<List<AlertRule>> rules = new AtomicReference<>(List.of());
+    private final Object stateLock = new Object();
     private final ConcurrentHashMap<String, SeriesState> states = new ConcurrentHashMap<>();
+    /**
+     * Test-only hook invoked inside {@link #evaluate()} after the rule
+     * snapshot is taken and before any decision is computed, so concurrency
+     * tests can interleave a rule change deterministically mid-pass.
+     * Never set in production.
+     */
+    public volatile Runnable evaluationHook = () -> { };
     private final CopyOnWriteArrayList<AlertEvent> firedAlerts = new CopyOnWriteArrayList<>();
     private final CopyOnWriteArrayList<EvaluationRecord> evaluationLog = new CopyOnWriteArrayList<>();
 
@@ -61,19 +75,26 @@ public final class AlertEngine {
         }
     }
 
-    /** Atomically replaces the rule set; evaluators see old or new, never a mix. */
+    /**
+     * Atomically replaces the rule set; evaluators see old or new, never a mix.
+     * Runs under the same lock as {@link #evaluate()}, so once this method
+     * returns, no in-flight evaluation can still write conclusions, alerts or
+     * runtime state for the previous definitions.
+     */
     public void updateRules(List<AlertRule> newRules) {
         List<AlertRule> copy = List.copyOf(newRules);
-        Map<String, AlertRule> previous = byName(rules.get());
-        Map<String, AlertRule> next = byName(copy);
-        rules.set(copy);
-        // Turn the page on changed or deleted rules: their trigger/cooldown/
-        // recovery state is dropped, so a redefined rule starts from a clean
-        // slate and a deleted rule releases its state. Windowed event data is
-        // kept per series and still counts toward the new definition.
-        ruleRuntimes.keySet().removeIf(name ->
-                !next.containsKey(name) || !next.get(name).equals(previous.get(name)));
-        log.info("alert rules updated atomically, count={}", newRules.size());
+        synchronized (stateLock) {
+            Map<String, AlertRule> previous = byName(rules.get());
+            Map<String, AlertRule> next = byName(copy);
+            rules.set(copy);
+            // Turn the page on changed or deleted rules: their trigger/cooldown/
+            // recovery state is dropped, so a redefined rule starts from a clean
+            // slate and a deleted rule releases its state. Windowed event data is
+            // kept per series and still counts toward the new definition.
+            ruleRuntimes.keySet().removeIf(name ->
+                    !next.containsKey(name) || !next.get(name).equals(previous.get(name)));
+            log.info("alert rules updated atomically, count={}", newRules.size());
+        }
     }
 
     private static Map<String, AlertRule> byName(List<AlertRule> ruleList) {
@@ -90,26 +111,33 @@ public final class AlertEngine {
 
     /**
      * Evaluates all rules once. Returns the alerts fired in this pass.
-     * Must be called from a single thread (the scheduler).
+     * Must be called from a single thread (the scheduler). The rule snapshot
+     * and the runtime mutations happen under {@link #stateLock}, so a rule
+     * change committed mid-evaluation either applies entirely before or
+     * entirely after this pass - never interleaved with it.
      */
     public List<AlertEvent> evaluate() {
         Instant now = clock.instant();
         evictIdleSeries(now);
         List<AlertEvent> fired = new ArrayList<>();
-        for (AlertRule rule : rules.get()) {
-            String series = rule.endpoint() + "|" + rule.statusClass();
-            SeriesState state = states.get(series);
-            long windowCount = countInWindow(state, rule.name(), rule.window(), now);
-            EvaluationRecord.Decision decision = decide(rule, windowCount, now);
-            evaluationLog.add(new EvaluationRecord(rule.name(), series, now, windowCount, rule.threshold(), decision));
-            log.debug("evaluate rule={} series={} windowCount={} threshold={} decision={}",
-                    rule.name(), series, windowCount, rule.threshold(), decision);
-            if (decision == EvaluationRecord.Decision.FIRED) {
-                AlertEvent event = new AlertEvent(rule.name(), series, now, windowCount, rule.threshold());
-                firedAlerts.add(event);
-                fired.add(event);
-                log.warn("ALERT fired rule={} series={} windowCount={} threshold={}",
-                        rule.name(), series, windowCount, rule.threshold());
+        synchronized (stateLock) {
+            List<AlertRule> snapshot = rules.get();
+            evaluationHook.run();
+            for (AlertRule rule : snapshot) {
+                String series = rule.endpoint() + "|" + rule.statusClass();
+                SeriesState state = states.get(series);
+                long windowCount = countInWindow(state, rule.name(), rule.window(), now);
+                EvaluationRecord.Decision decision = decide(rule, windowCount, now);
+                evaluationLog.add(new EvaluationRecord(rule.name(), series, now, windowCount, rule.threshold(), decision));
+                log.debug("evaluate rule={} series={} windowCount={} threshold={} decision={}",
+                        rule.name(), series, windowCount, rule.threshold(), decision);
+                if (decision == EvaluationRecord.Decision.FIRED) {
+                    AlertEvent event = new AlertEvent(rule.name(), series, now, windowCount, rule.threshold());
+                    firedAlerts.add(event);
+                    fired.add(event);
+                    log.warn("ALERT fired rule={} series={} windowCount={} threshold={}",
+                            rule.name(), series, windowCount, rule.threshold());
+                }
             }
         }
         return fired;
@@ -185,30 +213,34 @@ public final class AlertEngine {
      * Snapshot of each current rule's runtime status, consistent with the
      * evaluation log. Read-only: never mutates evaluator state. Rules that
      * were deleted or redefined since the last evaluation show up with their
-     * fresh (empty) runtime, or not at all.
+     * fresh (empty) runtime, or not at all. Taken under {@link #stateLock} so
+     * a rule change is never observed half-applied (e.g. new definition paired
+     * with the old definition's cooldown state).
      */
     public List<RuleStatus> ruleStatuses() {
         Instant now = clock.instant();
         List<RuleStatus> statuses = new ArrayList<>();
-        for (AlertRule rule : rules.get()) {
-            RuleRuntime rt = ruleRuntimes.get(rule.name());
-            if (rt == null) {
-                statuses.add(new RuleStatus(rule.name(), null, 0, rule.threshold(),
-                        null, false, Duration.ZERO, true, null));
-                continue;
-            }
-            boolean inCooldown = false;
-            Duration remaining = Duration.ZERO;
-            if (rt.lastFiredAt != null) {
-                Duration elapsed = Duration.between(rt.lastFiredAt, now);
-                if (elapsed.compareTo(rule.cooldown()) < 0) {
-                    inCooldown = true;
-                    remaining = rule.cooldown().minus(elapsed);
+        synchronized (stateLock) {
+            for (AlertRule rule : rules.get()) {
+                RuleRuntime rt = ruleRuntimes.get(rule.name());
+                if (rt == null) {
+                    statuses.add(new RuleStatus(rule.name(), null, 0, rule.threshold(),
+                            null, false, Duration.ZERO, true, null));
+                    continue;
                 }
+                boolean inCooldown = false;
+                Duration remaining = Duration.ZERO;
+                if (rt.lastFiredAt != null) {
+                    Duration elapsed = Duration.between(rt.lastFiredAt, now);
+                    if (elapsed.compareTo(rule.cooldown()) < 0) {
+                        inCooldown = true;
+                        remaining = rule.cooldown().minus(elapsed);
+                    }
+                }
+                statuses.add(new RuleStatus(rule.name(), rt.lastEvaluatedAt, rt.lastWindowCount,
+                        rule.threshold(), rt.lastDecision, inCooldown, remaining,
+                        rt.recovered, rt.lastFiredAt));
             }
-            statuses.add(new RuleStatus(rule.name(), rt.lastEvaluatedAt, rt.lastWindowCount,
-                    rule.threshold(), rt.lastDecision, inCooldown, remaining,
-                    rt.recovered, rt.lastFiredAt));
         }
         return statuses;
     }
